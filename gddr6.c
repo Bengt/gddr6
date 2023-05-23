@@ -29,12 +29,15 @@ struct device
     const char *vram;
     const char *arch;
     const char *name;
+    void *map_base;
+    uint32_t base_offset;
+    uint32_t phys_addr;
 };
 
 
 // variables
 int fd;
-void *map_base;
+int num_devs = 0;
 struct device devices[32];
 
 
@@ -62,10 +65,19 @@ void cleanup(int signal)
 {
     if (signal == SIGHUP || signal == SIGINT || signal == SIGTERM)
     {
-        if (map_base != (void *) -1)
-            munmap(map_base, PG_SZ);
+        for (int i = 0; i < num_devs; i++) 
+        {
+            struct device *device = &devices[i];
+            if (device->map_base != (void *) -1)
+            {
+                munmap(device->map_base, PG_SZ);
+                printf("\nmunmap: %p device: %d\n", device->map_base, i);
+            }
+        }
+
         if (fd != -1)
             close(fd);
+
         exit(0);
     }
 }
@@ -95,7 +107,7 @@ int pci_detect_dev(void)
 {
     struct pci_access *pacc = NULL;
     struct pci_dev *pci_dev = NULL;
-    int num_devs = 0;
+    int num_devices = 0;
     ssize_t dev_table_size = (sizeof(dev_table)/sizeof(struct device));
 
     pacc = pci_alloc();
@@ -110,18 +122,18 @@ int pci_detect_dev(void)
         {
             if (pci_dev->device_id == dev_table[i].dev_id)
             {
-                devices[num_devs] = dev_table[i];
-                devices[num_devs].bar0 = (pci_dev->base_addr[0] & 0xFFFFFFFF);
-                devices[num_devs].bus = pci_dev->bus;
-                devices[num_devs].dev = pci_dev->dev;
-                devices[num_devs].func = pci_dev->func;
-                num_devs++;
+                devices[num_devices] = dev_table[i];
+                devices[num_devices].bar0 = (pci_dev->base_addr[0] & 0xFFFFFFFF);
+                devices[num_devices].bus = pci_dev->bus;
+                devices[num_devices].dev = pci_dev->dev;
+                devices[num_devices].func = pci_dev->func;
+                num_devices++;
             }
         }
     }
 
     pci_cleanup(pacc);
-    return num_devs;
+    return num_devices;
 }
 
 
@@ -131,11 +143,10 @@ int main(int argc, char **argv)
     (void) argv;
     void *virt_addr;
     uint32_t temp;
-    uint32_t phys_addr;
+    // uint32_t phys_addr;
     uint32_t read_result;
-    uint32_t base_offset;
+    // uint32_t base_offset;
 
-    int num_devs;
     char *MEM = "\x2f\x64\x65\x76\x2f\x6d\x65\x6d";
 
     num_devs = pci_detect_dev();
@@ -146,7 +157,8 @@ int main(int argc, char **argv)
         exit(-1);
     }
 
-    for (int i = 0; i < num_devs; i++) {
+    for (int i = 0; i < num_devs; i++) 
+    {
         struct device *device = &devices[i];
         printf("Device: %s %s (%s / 0x%04x) pci=%x:%x:%x\n", device->name, device->vram,
             device->arch, device->dev_id, device->bus, device->dev, device->func);
@@ -160,25 +172,34 @@ int main(int argc, char **argv)
 
     cleanup_sig_handler();
 
+    // memory map all GPUs
+    for (int i = 0; i < num_devs; i++) 
+    {
+        struct device *device = &devices[i];
 
+        device->phys_addr = (device->bar0 + device->offset);
+        device->base_offset = device->phys_addr & ~(PG_SZ-1);
+        device->map_base = mmap(0, PG_SZ, PROT_READ | PROT_WRITE, MAP_SHARED, fd, device->base_offset);
+
+        if(device->map_base == (void *) -1)
+        {
+            if (fd != -1)
+                close(fd);
+            printf("Can't read memory. If you are root, enable kernel parameter iomem=relaxed\n");
+            PRINT_ERROR();
+        }
+        close(fd);
+    }
+    
+    // read temperatures
     while (1)
     {
         printf("\rVRAM Temps: |");
-        for (int i = 0; i < num_devs; i++) {
+        for (int i = 0; i < num_devs; i++) 
+        {
             struct device *device = &devices[i];
 
-            phys_addr = (device->bar0 + device->offset);
-            base_offset = phys_addr & ~(PG_SZ-1);
-            map_base = mmap(0, PG_SZ, PROT_READ | PROT_WRITE, MAP_SHARED, fd, base_offset);
-
-            if(map_base == (void *) -1)
-            {
-                if (fd != -1)
-                    close(fd);
-                printf("Can't read memory. If you are root, enable kernel parameter iomem=relaxed\n");
-                PRINT_ERROR();
-            }
-            virt_addr = (uint8_t *) map_base + (phys_addr - base_offset);
+            virt_addr = (uint8_t *) device->map_base + (device->phys_addr - device->base_offset);
             read_result = *((uint32_t *) virt_addr);
             temp = ((read_result & 0x00000fff) / 0x20);
 
